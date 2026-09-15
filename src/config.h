@@ -47,11 +47,11 @@ constexpr const char* NVS_KEY_GRIND_MS {"grind_ms"};
 constexpr const char* MDNS_HOSTNAME {"coffeegrinder"};
 constexpr uint16_t    SERVER_PORT {80};
 
-// Retry delay (ms) between WiFi connection attempts.
-constexpr uint32_t RETRY_DELAY_MS {5000};
+// How often (ms) the main loop services the network state machine.
+constexpr uint32_t NET_CHECK_INTERVAL_MS {500};
 
-// How often (ms) to check WiFi connectivity and re-join if disconnected.
-constexpr uint32_t WIFI_CHECK_INTERVAL_MS {60000};
+// Minimum gap (ms) between WiFi re-join attempts while disconnected.
+constexpr uint32_t RECONNECT_INTERVAL_MS {10000};
 
 // Program /////////////////////////////////////////////////////////////////////
 

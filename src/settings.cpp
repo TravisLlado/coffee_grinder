@@ -10,9 +10,14 @@ namespace {
 
 Preferences prefs;
 
-// Cached copy of flash state so the hot path never touches NVS
-uint32_t custom_ms{0};
-bool     custom_present{false};
+// Cached copy of flash state so the hot path never touches NVS.
+//
+// These are written from the WebSerial handler (AsyncTCP task) and read from
+// loop(), so effective_ms holds the duration to actually use rather than being
+// derived from two variables at read time. A single aligned word read can never
+// see a half-updated pair, so grindMs() needs no lock.
+volatile uint32_t effective_ms{DEFAULT_GRIND_MS};
+volatile bool     custom_present{false};
 
 }  // namespace
 
@@ -21,20 +26,25 @@ namespace Settings {
 void begin() {
   prefs.begin(NVS_NAMESPACE, false);
 
-  custom_present = prefs.isKey(NVS_KEY_GRIND_MS);
-  custom_ms      = custom_present ? prefs.getUInt(NVS_KEY_GRIND_MS, DEFAULT_GRIND_MS) : 0;
+  if (!prefs.isKey(NVS_KEY_GRIND_MS)) {
+    return;
+  }
+
+  const uint32_t stored{prefs.getUInt(NVS_KEY_GRIND_MS, DEFAULT_GRIND_MS)};
 
   // A stored value outside the accepted range means corrupt or stale flash;
   // drop it rather than driving the grinder for an unexpected length of time.
-  if (custom_present && (custom_ms < MIN_GRIND_MS || custom_ms > MAX_GRIND_MS)) {
+  if (stored < MIN_GRIND_MS || stored > MAX_GRIND_MS) {
     prefs.remove(NVS_KEY_GRIND_MS);
-    custom_present = false;
-    custom_ms      = 0;
+    return;
   }
+
+  effective_ms   = stored;
+  custom_present = true;
 }
 
 uint32_t grindMs() {
-  return custom_present ? custom_ms : DEFAULT_GRIND_MS;
+  return effective_ms;
 }
 
 bool hasCustom() {
@@ -47,7 +57,7 @@ bool setCustom(uint32_t ms) {
   }
 
   // Skip the flash write when nothing would change, to spare NVS wear
-  if (custom_present && custom_ms == ms) {
+  if (custom_present && effective_ms == ms) {
     return true;
   }
 
@@ -55,7 +65,7 @@ bool setCustom(uint32_t ms) {
     return false;
   }
 
-  custom_ms      = ms;
+  effective_ms   = ms;
   custom_present = true;
   return true;
 }
@@ -66,8 +76,8 @@ bool clearCustom() {
   }
 
   prefs.remove(NVS_KEY_GRIND_MS);
+  effective_ms   = DEFAULT_GRIND_MS;
   custom_present = false;
-  custom_ms      = 0;
   return true;
 }
 

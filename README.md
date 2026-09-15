@@ -15,8 +15,26 @@ grinder runs for a fixed number of seconds, then stops.
   (NVS) and used instead of the default until it is cleared.
 - The onboard LED is lit while the grinder is running.
 
+**Add a 10 kΩ pulldown from GPIO 4 to ground.** The pin is high-impedance from
+reset until `setup()` runs, and after any reset or crash mid-grind. Firmware
+cannot cover that window; the resistor defines the off state in hardware.
+GPIO 4 is not a strapping pin on the ESP32-C3, so this is safe to add.
+
 Pressing the button again while a grind is in progress is ignored, so a second
 press cannot extend or restart the run. Use `stop` to cut a run short.
+
+## Networking never blocks grinding
+
+The button and the grinder do not depend on the network. `setup()` starts WiFi
+and returns without waiting for it, and `loop()` never calls `delay()`, so the
+grinder works normally with the router down, the credentials wrong, or no
+network at all. WebSerial simply appears once the link comes up.
+
+WiFi and the web server already run on their own FreeRTOS tasks, so no extra
+task is needed here. The one thing that follows from that: `WebSerial.onMessage`
+runs on the AsyncTCP task, so the `run` and `stop` commands only raise a request
+flag and `loop()` performs the action. `loop()` is the sole owner of the grinder,
+which keeps timing correct without any locking.
 
 ## WebSerial
 

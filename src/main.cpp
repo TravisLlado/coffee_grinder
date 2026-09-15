@@ -5,6 +5,16 @@
  * switching the optocoupler that runs the grinder. The duration defaults to
  * DEFAULT_GRIND_MS and can be overridden over WebSerial; an override is saved
  * to flash and used until it is cleared.
+ *
+ * Threading: WiFi and the web server already run on their own FreeRTOS tasks
+ * (esp_wifi, and AsyncTCP's service task), so nothing here may block. setup()
+ * never waits for the network, and loop() never calls delay(). The button and
+ * the grinder therefore keep working with the network down or absent.
+ *
+ * The WebSerial handler runs on the AsyncTCP task, so it never touches the
+ * grinder directly - it only raises a request flag that loop() acts on. loop()
+ * is the single owner of the grinder, which keeps the timing correct without
+ * any locking.
  */
 
 #include <Arduino.h>
@@ -23,7 +33,8 @@
 
 void buttonAction();
 void onWebSerialMessage(uint8_t* data, size_t len);
-void connectWiFi();
+void serviceRequests();
+void serviceNetwork();
 void printStatus();
 void printHelp();
 void say(const String& msg);
@@ -34,8 +45,16 @@ AsyncWebServer server(SERVER_PORT);
 
 Button button(PIN_BUTTON, BUTTON_DEBOUNCE_MS, buttonAction);
 
+// Grinder commands arriving from the WebSerial handler, consumed by loop()
+volatile bool runRequested{false};
+volatile bool stopRequested{false};
+
 uint32_t lastTickMs{0};
-uint32_t lastWifiCheckMs{0};
+uint32_t lastNetCheckMs{0};
+uint32_t lastReconnectMs{0};
+
+bool wifiWasConnected{false};
+bool mdnsStarted{false};
 
 // Helpers /////////////////////////////////////////////////////////////////////
 
@@ -81,6 +100,7 @@ static bool parseSeconds(const String& arg, float& seconds) {
 
 // Button //////////////////////////////////////////////////////////////////////
 
+// Called from button.update(), so already on the loop() task
 void buttonAction() {
   const uint32_t ms{Settings::grindMs()};
 
@@ -114,6 +134,7 @@ void printHelp() {
   say("Accepted range: " + secondsStr(MIN_GRIND_MS) + " to " + secondsStr(MAX_GRIND_MS));
 }
 
+// Runs on the AsyncTCP task. Must not block and must not touch the grinder.
 void onWebSerialMessage(uint8_t* data, size_t len) {
   String cmd;
   for (size_t i{0}; i < len; i++) {
@@ -164,20 +185,10 @@ void onWebSerialMessage(uint8_t* data, size_t len) {
     }
 
   } else if (baseCmd == "run") {
-    const uint32_t ms{Settings::grindMs()};
-    if (Grinder::start(ms)) {
-      say("Grinding for " + secondsStr(ms));
-    } else {
-      say("Already grinding, ignored");
-    }
+    runRequested = true;
 
   } else if (baseCmd == "stop") {
-    if (Grinder::isRunning()) {
-      Grinder::stop();
-      say("Stopped");
-    } else {
-      say("Grinder is already idle");
-    }
+    stopRequested = true;
 
   } else if (baseCmd == "help") {
     printHelp();
@@ -187,22 +198,63 @@ void onWebSerialMessage(uint8_t* data, size_t len) {
   }
 }
 
-// WiFi ////////////////////////////////////////////////////////////////////////
+// Deferred work ///////////////////////////////////////////////////////////////
 
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(MDNS_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// Apply grinder commands raised by the WebSerial handler. Called from loop(),
+// so the grinder only ever changes state on one task.
+void serviceRequests() {
+  if (stopRequested) {
+    stopRequested = false;
 
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(RETRY_DELAY_MS);
-    Serial.print(".");
+    if (Grinder::isRunning()) {
+      Grinder::stop();
+      say("Stopped");
+    } else {
+      say("Grinder is already idle");
+    }
+  }
+
+  if (runRequested) {
+    runRequested = false;
+
+    const uint32_t ms{Settings::grindMs()};
+    if (Grinder::start(ms)) {
+      say("Grinding for " + secondsStr(ms));
+    } else {
+      say("Already grinding, ignored");
+    }
+  }
+}
+
+// Network /////////////////////////////////////////////////////////////////////
+
+// Watch the WiFi link and react to changes. Never blocks: WiFi.begin() returns
+// immediately and the connection completes on the WiFi task.
+void serviceNetwork() {
+  const bool connected{WiFi.status() == WL_CONNECTED};
+
+  if (connected && !wifiWasConnected) {
+    Serial.println("WiFi connected: " + WiFi.localIP().toString());
+
+    // mDNS needs a live interface, so it starts here rather than in setup()
+    if (!mdnsStarted && MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("http", "tcp", SERVER_PORT);
+      mdnsStarted = true;
+      Serial.println(String("WebSerial: http://") + MDNS_HOSTNAME + ".local/");
+    }
+    Serial.println("WebSerial: http://" + WiFi.localIP().toString() + "/");
+
+  } else if (!connected && wifiWasConnected) {
+    Serial.println("WiFi lost, retrying in the background");
+  }
+
+  // Backstop for the core's own auto-reconnect
+  if (!connected && (millis() - lastReconnectMs) >= RECONNECT_INTERVAL_MS) {
+    lastReconnectMs = millis();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 
-  Serial.println();
-  Serial.println("WiFi connected: " + WiFi.localIP().toString());
+  wifiWasConnected = connected;
 }
 
 // Setup ///////////////////////////////////////////////////////////////////////
@@ -210,7 +262,7 @@ void connectWiFi() {
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
 
-  // Grinder output first, so the relay is held off through the rest of boot
+  // Grinder output first, so the pin is driven low before anything else runs
   Grinder::begin();
   button.begin();
   Settings::begin();
@@ -220,24 +272,19 @@ void setup() {
   Serial.println("Duration: " + secondsStr(Settings::grindMs()) +
                  (Settings::hasCustom() ? " (custom)" : " (default)"));
 
-  connectWiFi();
+  // Kick off WiFi and return immediately; the link comes up on its own task
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastReconnectMs = millis();
 
-  if (MDNS.begin(MDNS_HOSTNAME)) {
-    MDNS.addService("http", "tcp", SERVER_PORT);
-    Serial.println(String("mDNS: http://") + MDNS_HOSTNAME + ".local/");
-  } else {
-    Serial.println("mDNS failed to start");
-  }
-
+  // The server binds to any address, so it can start before the link is up
   WebSerial.onMessage(onWebSerialMessage);
   WebSerial.begin(&server, "/");
   server.begin();
 
-  Serial.println("WebSerial: http://" + WiFi.localIP().toString() + "/");
-
-  WebSerial.println("Coffee Grinder Timer ready.");
-  printStatus();
-  WebSerial.println("Type 'help' for commands.");
+  Serial.println("Ready. The button works whether or not WiFi connects.");
 }
 
 // Loop ////////////////////////////////////////////////////////////////////////
@@ -249,17 +296,12 @@ void loop() {
     lastTickMs = now;
     button.update();
     Grinder::update();
+    serviceRequests();
   }
 
-  // Re-join WiFi if it drops. The button and grinder keep working regardless;
-  // only WebSerial needs the network.
-  if ((now - lastWifiCheckMs) >= WIFI_CHECK_INTERVAL_MS) {
-    lastWifiCheckMs = now;
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi lost, reconnecting...");
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
+  if ((now - lastNetCheckMs) >= NET_CHECK_INTERVAL_MS) {
+    lastNetCheckMs = now;
+    serviceNetwork();
   }
 }
 
