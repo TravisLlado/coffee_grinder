@@ -1,0 +1,12 @@
+build/
+.cache/
+compile_commands.json
+.vscode/
+.DS_Store
+keys.py
+*.crt
+*.key
+*.pem
+.pio
+credentials.h
+.vscode/
